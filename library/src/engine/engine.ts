@@ -1,9 +1,4 @@
-import {
-  DATASTAR_FETCH_EVENT,
-  DATASTAR_READY_EVENT,
-  DSP,
-  DSS,
-} from '@engine/consts'
+import { DATASTAR_FETCH_EVENT, DATASTAR_READY_EVENT } from '@engine/consts'
 import { root } from '@engine/signals'
 import type {
   ActionContext,
@@ -438,17 +433,6 @@ export const genRx = (
     expr = value.trim()
   }
 
-  // Ignore any escaped values
-  const escaped = new Map<string, string>()
-  const escapeRe = RegExp(`(?:${DSP})(.*?)(?:${DSS})`, 'gm')
-  let counter = 0
-  for (const match of expr.matchAll(escapeRe)) {
-    const k = match[1]
-    const v = `__escaped${counter++}`
-    escaped.set(v, k)
-    expr = expr.replace(DSP + k + DSS, v)
-  }
-
   // Replace signal references with bracket notation
   // Examples:
   //   $count          -> $['count']
@@ -464,36 +448,48 @@ export const genRx = (
   //   $123            -> $['123']
   //   $foo.0.name     -> $['foo']['0']['name']
 
-  // Skip replacements inside string/template literals.
-  // Template interpolation support rewrites `${...}` only when braces are non-nested.
-  expr = expr.replace(
-    /(?:"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|`[^`\\$]*(?:(?:\\.|\$(?!\{))[^`\\$]*)*`)|\$\{([^{}]*)\}|\$(\w+(?:[.-]\w+)*)/g,
-    (match, interpolationExpr, signalName) => {
-      // If `interpolationExpr` and `signalName` are both undefined, it means we matched a quoted string literal.
-      if (interpolationExpr === undefined && signalName === undefined) {
-        return match
+  // Skip replacements inside strings and template raw text while rewriting
+  // executable template interpolations.
+  const rewrite = (source: string): string => {
+    let index = 0
+    const codeRe =
+      /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`|[{}]|\$(\w+(?:[.-]\w+)*)|@([A-Za-z_$][\w$]*)\(/g
+    const templateRe = /\\.|`|\$\{/g
+    const rewriteCode = (inInterpolation = false): string => {
+      let result = ''
+      while (index < source.length) {
+        codeRe.lastIndex = index
+        const match = codeRe.exec(source)
+        if (!match) return result + source.slice(index)
+        result += source.slice(index, match.index)
+        index = codeRe.lastIndex
+        if (match[0] === '`') result += rewriteTemplate()
+        else if (inInterpolation && match[0] === '}') return `${result}}`
+        else if (inInterpolation && match[0] === '{') {
+          result += `{${rewriteCode(true)}`
+        } else if (match[1]) {
+          result += `$['${match[1].replaceAll('.', "']['")}']`
+        } else if (match[2]) result += `__action("${match[2]}",evt,`
+        else result += match[0]
       }
-
-      const formatSignal = (name: string) =>
-        name.split('.').reduce((acc, part) => `${acc}['${part}']`, '$')
-
-      if (interpolationExpr !== undefined) {
-        return `\${${interpolationExpr.replace(
-          /\$(\w+(?:[.-]\w+)*)/g,
-          (_: string, innerSignalName: string) => formatSignal(innerSignalName),
-        )}}`
+      return result
+    }
+    const rewriteTemplate = (): string => {
+      let result = '`'
+      while (index < source.length) {
+        templateRe.lastIndex = index
+        const match = templateRe.exec(source)
+        if (!match) return result + source.slice(index)
+        result += source.slice(index, match.index) + match[0]
+        index = templateRe.lastIndex
+        if (match[0] === '`') break
+        if (match[0] === '${') result += rewriteCode(true)
       }
-
-      return formatSignal(signalName!)
-    },
-  )
-
-  expr = expr.replaceAll(/@([A-Za-z_$][\w$]*)\(/g, '__action("$1",evt,')
-
-  // Replace any escaped values
-  for (const [k, v] of escaped) {
-    expr = expr.replace(k, v)
+      return result
+    }
+    return rewriteCode()
   }
+  expr = rewrite(expr)
 
   try {
     const fn = Function('el', '$', '__action', 'evt', ...argNames, expr)
